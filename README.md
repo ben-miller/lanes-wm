@@ -7,8 +7,19 @@ what a "lane" is.
 
 ## Status
 
-Early scaffold. The CLI shape (`main.rs`) is defined; the actual macOS calls
-are `todo!()`. Not yet wired into lanes-cli.
+`monitors` is implemented and working (CoreGraphics for display IDs and
+bounds, ColorSync's `CGDisplayCreateUUIDFromDisplayID` for UUIDs - see note
+below). `place` and `apply` are still `todo!()`. Not yet wired into
+lanes-cli.
+
+**Monitor names are a coarse placeholder** ("Built-in Display" /
+"External Display (<id>)"), not the real product name. The standard way to
+get that (EDID via `IODisplayConnect`) is unreliable on Apple Silicon, so
+it's deliberately skipped for now rather than shipping something that
+silently returns wrong names on M-series Macs. Since placement matches by
+UUID, not name, this doesn't block `place`/`apply` - it only makes `monitors`
+output less human-readable. A future fix would probe `IODPDevice` or shell
+out to `system_profiler SPDisplaysDataType -json`.
 
 ## Why this exists
 
@@ -76,6 +87,9 @@ stdout (JSON): every monitor currently attached, nothing configured/assumed.
 ```json
 [{"uuid": "37D8832A-...", "name": "Built-in Retina Display", "frame": {"x": 0, "y": 0, "w": 1512, "h": 982}}]
 ```
+
+All commands pretty-print JSON by default; pass `--compact` for single-line
+output when piping to another program, e.g. `lanes-wm monitors --compact`.
 
 ```
 lanes-wm place --app <bundle-id> --monitor <uuid> --position <preset>
