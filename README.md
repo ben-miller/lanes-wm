@@ -7,10 +7,12 @@ what a "lane" is.
 
 ## Status
 
-`monitors` is implemented and working (CoreGraphics for display IDs and
-bounds, ColorSync's `CGDisplayCreateUUIDFromDisplayID` for UUIDs - see note
-below). `place` and `apply` are still `todo!()`. Not yet wired into
-lanes-cli.
+`monitors`, `place`, and `apply` are all implemented and verified working
+end-to-end against real windows (CoreGraphics for display IDs and bounds,
+ColorSync's `CGDisplayCreateUUIDFromDisplayID` for UUIDs - see note below;
+the Accessibility `AXUIElement` API for window resolution and placement -
+see "Local dev setup" below for the one-time permission/signing steps this
+requires). Not yet wired into lanes-cli.
 
 **Monitor names are a coarse placeholder** ("Built-in Display" /
 "External Display (<id>)"), not the real product name. The standard way to
@@ -92,23 +94,88 @@ All commands pretty-print JSON by default; pass `--compact` for single-line
 output when piping to another program, e.g. `lanes-wm monitors --compact`.
 
 ```
-lanes-wm place --app <bundle-id> --monitor <uuid> --position <preset>
+lanes-wm place --app <bundle-id> --monitor <uuid> --position <preset> [--title <regex>]
 ```
 Single placement. Exit 0 on success; non-zero + stderr message on failure
 (app not running, monitor not found, etc).
 
+`--title` is an optional regex matched against each of the app's window
+titles (via `kAXTitleAttribute`), for apps with more than one window open.
+There's no stable window identifier in the Accessibility API, so title
+matching is the established approach (yabai does the same). Matching is
+strict on purpose: 0 matches or 2+ matches is an error, not a guess - see
+"Design decisions" above for why. Omit `--title` only when the app is known
+to have exactly one window.
+
 ```
 lanes-wm apply
 ```
-Reads a JSON array of placement requests from stdin:
+The primary interface: reads a JSON array of placement requests from stdin
+and applies them as a single batch (one call, not a loop of single
+placements) - this is how a lane's whole window layout gets applied in one
+shot. Each `app` is resolved once, then every matched window for that app is
+placed:
 ```json
-[{"app": "com.github.wez.wezterm", "monitor": "37D8832A-...", "position": "full"}]
+[{"app": "com.github.wez.wezterm", "monitor": "37D8832A-...", "position": "full", "title": "main"}]
 ```
-Writes one result per input to stdout, so a partial failure doesn't abort
-the batch:
+`title` is optional, same regex semantics as `place --title`. Writes one
+result per input to stdout, so a partial failure doesn't abort the batch:
 ```json
 [{"app": "com.github.wez.wezterm", "ok": true}]
 ```
+
+```
+lanes-wm request-access
+```
+Triggers the native macOS "lanes-wm would like to control this computer
+using accessibility features" prompt (via `AXIsProcessTrustedWithOptions`),
+or reports that access is already granted. Use this instead of manually
+adding the binary through the Accessibility settings `+` button, which
+doesn't reliably register raw (non-`.app`-bundle) executables.
+
+## Local dev setup: Accessibility permissions
+
+Placing windows requires the Accessibility (TCC) permission grant (System
+Settings > Privacy & Security > Accessibility). Getting this to survive
+repeated `cargo build` during development takes a couple of one-time setup
+steps, because of two macOS quirks:
+
+**1. Ad-hoc signing changes identity on every rebuild.** `codesign --sign -`
+(ad-hoc signing) bakes a hash of the binary's own content into its identity,
+so every rebuild looks like a brand new, never-approved program to macOS and
+silently drops the grant. The fix is to sign with a real (self-signed,
+local-only is fine) certificate instead, so the binary's Designated
+Requirement is based on the certificate, not the content hash, and the grant
+survives rebuilds. One-time setup:
+1. Keychain Access > Certificate Assistant > Create a Certificate: name it
+   (e.g. `lanes-wm dev`), type "Code Signing", Identity Type "Self Signed
+   Root".
+2. In Keychain Access, find that certificate, open it, expand "Trust", and
+   set "Code Signing" to "Always Trust".
+3. Run `./sign.sh` after every `cargo build` (or wire it into your build
+   workflow) - it re-signs `target/debug/lanes-wm` with that certificate and
+   a stable bundle identifier (`com.lanes.lanes-wm`).
+
+**2. Raw executables need an embedded `Info.plist`.** TCC identifies apps by
+bundle identifier, which for a normal `.app` comes from its bundle's
+`Info.plist`. A raw Unix executable (no `.app` wrapper) has no such thing by
+default, so `build.rs` embeds `Info.plist` directly into the binary as a
+`__TEXT,__info_plist` Mach-O section (linker `-sectcreate`) at build time.
+This happens automatically on every `cargo build` - no manual step needed.
+
+With both in place: run `lanes-wm request-access` once to trigger the
+permission prompt, click Allow, and it should stick across rebuilds as long
+as you keep re-running `./sign.sh` after each build.
+
+If you ever end up in a genuinely broken TCC state (grant shown as on in
+Settings but `AXIsProcessTrusted()` still reports false, entries that won't
+reset via `tccutil reset Accessibility <bundle-id>`), a full reboot has been
+the only reliable fix found so far - the TCC daemon (`tccd`) appears to
+cache stale state that `sudo killall tccd` doesn't fully clear.
+
+**Do not run `tccutil reset Accessibility` with no bundle ID** - that resets
+the grant for every app on the system, not just this one. Always pass the
+bundle identifier.
 
 ## The long-term arc
 
