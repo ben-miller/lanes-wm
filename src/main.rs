@@ -1,9 +1,9 @@
 use accessibility_sys::{
-    kAXErrorFailure, kAXErrorSuccess, kAXPositionAttribute, kAXSizeAttribute, kAXTitleAttribute,
-    kAXTrustedCheckOptionPrompt, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
-    pid_t, AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions,
-    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementRef,
-    AXUIElementSetAttributeValue, AXValueCreate,
+    kAXErrorFailure, kAXErrorSuccess, kAXFocusedWindowAttribute, kAXPositionAttribute,
+    kAXSizeAttribute, kAXTitleAttribute, kAXTrustedCheckOptionPrompt, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXWindowsAttribute, pid_t, AXError, AXIsProcessTrusted,
+    AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
+    AXUIElementRef, AXUIElementSetAttributeValue, AXValueCreate,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use core_foundation::base::TCFType;
@@ -81,6 +81,18 @@ impl AxElement {
         windows
     }
 
+    /// This app's currently-focused window, per kAXFocusedWindowAttribute -
+    /// the app's own notion of which window is active, no title matching
+    /// involved. None if the app has no focused window (e.g. it has no
+    /// windows at all, or the attribute isn't readable).
+    fn focused_window(&self) -> Option<AxElement> {
+        let value = self.copy_attribute(kAXFocusedWindowAttribute).ok()?;
+        if value.is_null() {
+            return None;
+        }
+        Some(AxElement(value as AXUIElementRef))
+    }
+
     fn title(&self) -> Option<String> {
         let value = self.copy_attribute(kAXTitleAttribute).ok()?;
         if value.is_null() {
@@ -137,16 +149,45 @@ fn pids_for_bundle_id(bundle_id: &str) -> Vec<pid_t> {
         .collect()
 }
 
-/// Find the single window matching `app` (and, if given, a regex `title`
-/// pattern). Deliberately strict: zero or multiple matches is an error, not
-/// a guess - see README's "fail loudly" philosophy for monitor matching,
-/// which applies just as much to windows.
-fn find_window(app: &str, title: Option<&str>) -> Result<AxElement, String> {
+/// How to pick which of an app's windows a placement applies to.
+#[derive(Debug)]
+enum Selector {
+    /// Only valid when the app has exactly one window.
+    Any,
+    /// Regex matched against kAXTitleAttribute.
+    Title(String),
+    /// Whichever window is currently focused (kAXFocusedWindowAttribute),
+    /// no title involved. For apps whose titles reflect content rather than
+    /// identity (e.g. Obsidian's title is "<note> - <vault> - Obsidian") -
+    /// the caller is expected to have already made the right window
+    /// frontmost (e.g. via an app-specific URI/CLI) before calling this.
+    Focused,
+}
+
+/// Find the single window matching `app` and `selector`. Deliberately
+/// strict: zero or multiple matches is an error, not a guess - see
+/// README's "fail loudly" philosophy for monitor matching, which applies
+/// just as much to windows.
+fn find_window(app: &str, selector: &Selector) -> Result<AxElement, String> {
     log::debug!("AXIsProcessTrusted: {}", unsafe { AXIsProcessTrusted() });
     let pids = pids_for_bundle_id(app);
     log::debug!("pids for {app}: {pids:?}");
     if pids.is_empty() {
         return Err(format!("app not running: {app}"));
+    }
+
+    if let Selector::Focused = selector {
+        let matched: Vec<AxElement> = pids
+            .into_iter()
+            .filter_map(|pid| AxElement::for_pid(pid).focused_window())
+            .collect();
+        return match matched.len() {
+            0 => Err(format!("no focused window (app: {app})")),
+            1 => Ok(matched.into_iter().next().unwrap()),
+            n => Err(format!(
+                "ambiguous: {n} instances of {app} each have a focused window"
+            )),
+        };
     }
 
     let windows: Vec<AxElement> = pids
@@ -158,22 +199,23 @@ fn find_window(app: &str, title: Option<&str>) -> Result<AxElement, String> {
         })
         .collect();
 
-    let matched: Vec<AxElement> = match title {
-        None => windows,
-        Some(pattern) => {
+    let matched: Vec<AxElement> = match selector {
+        Selector::Any => windows,
+        Selector::Title(pattern) => {
             let re = regex::Regex::new(pattern).map_err(|e| format!("invalid title pattern {pattern:?}: {e}"))?;
             windows
                 .into_iter()
                 .filter(|w| w.title().is_some_and(|t| re.is_match(&t)))
                 .collect()
         }
+        Selector::Focused => unreachable!("handled above"),
     };
 
     match matched.len() {
-        0 => Err(format!("no window matched (app: {app}, title: {title:?})")),
+        0 => Err(format!("no window matched (app: {app}, selector: {selector:?})")),
         1 => Ok(matched.into_iter().next().unwrap()),
         n => Err(format!(
-            "ambiguous: {n} windows matched (app: {app}, title: {title:?}) - narrow the title pattern"
+            "ambiguous: {n} windows matched (app: {app}, selector: {selector:?}) - narrow the title pattern"
         )),
     }
 }
@@ -241,9 +283,18 @@ enum Command {
         position: Position,
         /// Regex matched against window titles, to pick one window when the
         /// app has more than one. Required if the app has more than one
-        /// window open; omit only when it has exactly one.
-        #[arg(long)]
+        /// window open; omit only when it has exactly one. Conflicts with
+        /// --focused.
+        #[arg(long, conflicts_with = "focused")]
         title: Option<String>,
+        /// Target whichever window is currently focused for this app,
+        /// instead of matching by title. For apps whose titles reflect
+        /// content rather than identity (e.g. Obsidian) - the caller is
+        /// expected to have already made the right window frontmost (e.g.
+        /// via an app-specific URI/CLI) before calling this. Conflicts
+        /// with --title.
+        #[arg(long)]
+        focused: bool,
     },
 
     /// Apply a batch of placements read as JSON from stdin, one result per
@@ -274,6 +325,27 @@ struct PlacementRequest {
     position: Position,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    focused: bool,
+}
+
+impl PlacementRequest {
+    fn selector(&self) -> Result<Selector, String> {
+        selector_from(self.title.clone(), self.focused)
+    }
+}
+
+/// Build a Selector from the (title, focused) pair shared by the CLI flags
+/// and PlacementRequest's JSON fields. Errors if both are set - same
+/// mutual-exclusivity `place`'s clap flags enforce, since a JSON batch
+/// request bypasses clap's `conflicts_with`.
+fn selector_from(title: Option<String>, focused: bool) -> Result<Selector, String> {
+    match (title, focused) {
+        (Some(_), true) => Err("title and focused are mutually exclusive".to_string()),
+        (Some(t), false) => Ok(Selector::Title(t)),
+        (None, true) => Ok(Selector::Focused),
+        (None, false) => Ok(Selector::Any),
+    }
 }
 
 #[derive(Serialize)]
@@ -304,8 +376,12 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Monitors => list_monitors(cli.compact),
-        Command::Place { app, monitor, position, title } => {
-            if let Err(e) = place(&app, &monitor, position, title.as_deref()) {
+        Command::Place { app, monitor, position, title, focused } => {
+            let selector = selector_from(title, focused).unwrap_or_else(|e| {
+                eprintln!("lanes-wm: {e}");
+                std::process::exit(1);
+            });
+            if let Err(e) = place(&app, &monitor, position, &selector) {
                 eprintln!("lanes-wm: {e}");
                 std::process::exit(1);
             }
@@ -374,11 +450,11 @@ fn list_monitors(compact: bool) {
     print_json(&monitors, compact);
 }
 
-fn place(app: &str, monitor: &str, position: Position, title: Option<&str>) -> Result<(), String> {
-    log::info!("placing app={app} monitor={monitor} position={position:?} title={title:?}");
+fn place(app: &str, monitor: &str, position: Position, selector: &Selector) -> Result<(), String> {
+    log::info!("placing app={app} monitor={monitor} position={position:?} selector={selector:?}");
     let bounds = monitor_bounds(monitor)?;
     let frame = position_frame(bounds, position);
-    let window = find_window(app, title)?;
+    let window = find_window(app, selector)?;
     window.set_frame(frame)
 }
 
@@ -394,7 +470,9 @@ fn apply(compact: bool) {
     let results: Vec<PlacementResult> = requests
         .into_iter()
         .map(|req| {
-            let outcome = place(&req.app, &req.monitor, req.position, req.title.as_deref());
+            let outcome = req
+                .selector()
+                .and_then(|selector| place(&req.app, &req.monitor, req.position, &selector));
             match outcome {
                 Ok(()) => PlacementResult { app: req.app, ok: true, error: None },
                 Err(e) => {

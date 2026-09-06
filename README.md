@@ -94,18 +94,32 @@ All commands pretty-print JSON by default; pass `--compact` for single-line
 output when piping to another program, e.g. `lanes-wm monitors --compact`.
 
 ```
-lanes-wm place --app <bundle-id> --monitor <uuid> --position <preset> [--title <regex>]
+lanes-wm place --app <bundle-id> --monitor <uuid> --position <preset> [--title <regex> | --focused]
 ```
 Single placement. Exit 0 on success; non-zero + stderr message on failure
 (app not running, monitor not found, etc).
 
-`--title` is an optional regex matched against each of the app's window
-titles (via `kAXTitleAttribute`), for apps with more than one window open.
-There's no stable window identifier in the Accessibility API, so title
-matching is the established approach (yabai does the same). Matching is
-strict on purpose: 0 matches or 2+ matches is an error, not a guess - see
-"Design decisions" above for why. Omit `--title` only when the app is known
-to have exactly one window.
+Two mutually exclusive, optional ways to pick which window when the app has
+more than one - omit both only when the app is known to have exactly one
+window:
+
+- `--title` - a regex matched against each of the app's window titles (via
+  `kAXTitleAttribute`). There's no stable window identifier in the
+  Accessibility API, so title matching is the established approach (yabai
+  does the same) - but it's inherently unreliable for apps whose titles
+  reflect current content rather than window identity (e.g. Obsidian's
+  title is `<note> - <vault> - Obsidian`, which changes every time you
+  switch notes).
+- `--focused` - targets whichever window is currently focused for the app
+  (`kAXFocusedWindowAttribute`), no title involved at all. Meant for the
+  case above: the caller first runs some app-specific command to
+  deterministically make the right window frontmost (an `obsidian://`
+  vault URI, a CLI tool, whatever the app supports), *then* calls `place
+  --focused` to act on whatever that left focused - the frontmost-making
+  and the placement are two separate steps, this only does the second.
+
+Matching is strict either way: 0 matches or 2+ matches is an error, not a
+guess - see "Design decisions" above for why.
 
 ```
 lanes-wm apply
@@ -118,8 +132,11 @@ placed:
 ```json
 [{"app": "com.github.wez.wezterm", "monitor": "37D8832A-...", "position": "full", "title": "main"}]
 ```
-`title` is optional, same regex semantics as `place --title`. Writes one
-result per input to stdout, so a partial failure doesn't abort the batch:
+`title` and `focused` are optional, same semantics as `place`'s flags, and
+still mutually exclusive - a request setting both is a per-item failure, not
+a crash (JSON input bypasses the CLI's flag-conflict check, so it's
+re-validated here). Writes one result per input to stdout, so a partial
+failure doesn't abort the batch:
 ```json
 [{"app": "com.github.wez.wezterm", "ok": true}]
 ```
