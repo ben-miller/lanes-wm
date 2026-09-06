@@ -68,10 +68,17 @@ a way that's notably cleaner than the equivalent in a GC'd language without
 ownership tracking (Go's binding for the same API leaves retain/release
 bookkeeping as the caller's problem).
 
-**Position is a closed preset enum, not a fraction DSL.** `full`,
-`left-half`, `right-half`, `top-half`, `bottom-half` today, borrowed from
-Rectangle's naming (a well-known, already-recognizable vocabulary), with
-thirds/quarters as an anticipated but not-yet-built extension.
+**Position is a CSS-Grid-style grid span, with presets as named shorthand
+over it.** A generic mechanism should take a rectangle, not bake in UI
+naming conventions - so the actual representation is a `cols` x `rows` grid
+and a 1-based column/row span within it (`{"cols": 3, "col": [1, 2]}` is
+"the left two-thirds"), the same model CSS Grid uses (N tracks, placement by
+span of track indices). `full`/`left-half`/`right-half`/`top-half`/
+`bottom-half` (Rectangle's vocabulary) are just well-known spans of a 1x1 or
+2x1/1x2 grid, resolved to the same underlying rect - convenient shorthand
+for the common cases, not a separate mechanism. `place`'s CLI flag only
+accepts the presets (it's a manual-testing convenience, not the primary
+interface); `apply`'s JSON contract accepts either form in `position`.
 
 **Monitors are matched by exact UUID, no fallback matching.** Deliberately
 strict: if a monitor's UUID drifts (reconnect, cable swap), a placement
@@ -132,6 +139,15 @@ placed:
 ```json
 [{"app": "com.github.wez.wezterm", "monitor": "37D8832A-...", "position": "full", "title": "main"}]
 ```
+`position` accepts either a preset string (as above) or a raw grid span -
+`{"cols": 3, "col": [1, 2]}` is the left two-thirds, `{"cols": 2, "col": [1,
+1], "rows": 2, "row": [1, 1]}` is the top-left quadrant. `cols`/`rows`
+default to `1` and `col`/`row` default to `[1, 1]` when omitted, so an
+axis you don't care about (usually `rows`/`row`) can be left out entirely.
+Spans are 1-based and inclusive, validated against the grid's own
+dimensions - an out-of-range span (`col: [4, 4]` on a 3-column grid) is a
+placement failure, not a silent clamp.
+
 `title` and `focused` are optional, same semantics as `place`'s flags, and
 still mutually exclusive - a request setting both is a per-item failure, not
 a crash (JSON input bypasses the CLI's flag-conflict check, so it's

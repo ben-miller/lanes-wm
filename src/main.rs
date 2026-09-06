@@ -230,17 +230,112 @@ fn monitor_bounds(uuid_str: &str) -> Result<CGRect, String> {
     Err(format!("monitor not found: {uuid_str}"))
 }
 
-fn position_frame(bounds: CGRect, position: Position) -> CGRect {
-    let CGRect { origin, size } = bounds;
-    let (x, y, w, h) = (origin.x, origin.y, size.width, size.height);
-    let (px, py, pw, ph) = match position {
-        Position::Full => (x, y, w, h),
-        Position::LeftHalf => (x, y, w / 2.0, h),
-        Position::RightHalf => (x + w / 2.0, y, w / 2.0, h),
-        Position::TopHalf => (x, y, w, h / 2.0),
-        Position::BottomHalf => (x, y + h / 2.0, w, h / 2.0),
-    };
-    CGRect::new(&CGPoint::new(px, py), &CGSize::new(pw, ph))
+/// Divide a monitor into a `cols` x `rows` grid (CSS Grid's model: N tracks,
+/// placement by 1-based span of track indices) and compute the rect a given
+/// column/row span occupies. Generalizes the five presets, which are just
+/// well-known spans of a 1x1 or 2x1/1x2 grid - see `Preset::to_grid`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Grid {
+    #[serde(default = "one")]
+    cols: u32,
+    #[serde(default = "unit_span")]
+    col: (u32, u32),
+    #[serde(default = "one")]
+    rows: u32,
+    #[serde(default = "unit_span")]
+    row: (u32, u32),
+}
+
+fn one() -> u32 {
+    1
+}
+fn unit_span() -> (u32, u32) {
+    (1, 1)
+}
+
+impl Grid {
+    fn validate(&self) -> Result<(), String> {
+        if self.cols == 0 || self.rows == 0 {
+            return Err("grid cols/rows must be >= 1".to_string());
+        }
+        let (c0, c1) = self.col;
+        let (r0, r1) = self.row;
+        if c0 == 0 || r0 == 0 {
+            return Err("grid col/row spans are 1-based - use 1, not 0".to_string());
+        }
+        if c0 > c1 || c1 > self.cols {
+            return Err(format!("col span {c0}-{c1} out of range for {} column(s)", self.cols));
+        }
+        if r0 > r1 || r1 > self.rows {
+            return Err(format!("row span {r0}-{r1} out of range for {} row(s)", self.rows));
+        }
+        Ok(())
+    }
+
+    fn frame(&self, bounds: CGRect) -> CGRect {
+        let CGRect { origin, size } = bounds;
+        let (x, y, w, h) = (origin.x, origin.y, size.width, size.height);
+        let col_w = w / self.cols as f64;
+        let row_h = h / self.rows as f64;
+        let (c0, c1) = self.col;
+        let (r0, r1) = self.row;
+        let px = x + (c0 - 1) as f64 * col_w;
+        let py = y + (r0 - 1) as f64 * row_h;
+        let pw = (c1 - c0 + 1) as f64 * col_w;
+        let ph = (r1 - r0 + 1) as f64 * row_h;
+        CGRect::new(&CGPoint::new(px, py), &CGSize::new(pw, ph))
+    }
+}
+
+/// Named shorthand for common grid spans, borrowed from Rectangle's
+/// vocabulary. This is the only form `place`'s CLI flag accepts (it's a
+/// manual-testing convenience, not the primary interface); `apply`'s JSON
+/// contract accepts a `Grid` directly too, via `Position`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum Preset {
+    Full,
+    LeftHalf,
+    RightHalf,
+    TopHalf,
+    BottomHalf,
+}
+
+impl Preset {
+    fn to_grid(self) -> Grid {
+        match self {
+            Preset::Full => Grid { cols: 1, col: (1, 1), rows: 1, row: (1, 1) },
+            Preset::LeftHalf => Grid { cols: 2, col: (1, 1), rows: 1, row: (1, 1) },
+            Preset::RightHalf => Grid { cols: 2, col: (2, 2), rows: 1, row: (1, 1) },
+            Preset::TopHalf => Grid { cols: 1, col: (1, 1), rows: 2, row: (1, 1) },
+            Preset::BottomHalf => Grid { cols: 1, col: (1, 1), rows: 2, row: (2, 2) },
+        }
+    }
+}
+
+/// Either a named preset or a raw grid span - accepted interchangeably
+/// wherever a placement's position is given in JSON (`"full"` or
+/// `{"cols": 3, "col": [1, 2]}`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Position {
+    Preset(Preset),
+    Grid(Grid),
+}
+
+impl Position {
+    fn to_grid(self) -> Grid {
+        match self {
+            Position::Preset(p) => p.to_grid(),
+            Position::Grid(g) => g,
+        }
+    }
+}
+
+fn position_frame(bounds: CGRect, position: Position) -> Result<CGRect, String> {
+    let grid = position.to_grid();
+    grid.validate()?;
+    Ok(grid.frame(bounds))
 }
 
 /// lanes-wm: a standalone, lane-agnostic window-placement primitive for macOS.
@@ -280,7 +375,7 @@ enum Command {
         monitor: String,
         /// Placement preset
         #[arg(long, value_enum)]
-        position: Position,
+        position: Preset,
         /// Regex matched against window titles, to pick one window when the
         /// app has more than one. Required if the app has more than one
         /// window open; omit only when it has exactly one. Conflicts with
@@ -306,16 +401,6 @@ enum Command {
     /// System Settings > Privacy & Security > Accessibility does not
     /// reliably register - this does it the way macOS expects.
     RequestAccess,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum Position {
-    Full,
-    LeftHalf,
-    RightHalf,
-    TopHalf,
-    BottomHalf,
 }
 
 #[derive(Deserialize)]
@@ -381,7 +466,7 @@ fn main() {
                 eprintln!("lanes-wm: {e}");
                 std::process::exit(1);
             });
-            if let Err(e) = place(&app, &monitor, position, &selector) {
+            if let Err(e) = place(&app, &monitor, Position::Preset(position), &selector) {
                 eprintln!("lanes-wm: {e}");
                 std::process::exit(1);
             }
@@ -453,7 +538,7 @@ fn list_monitors(compact: bool) {
 fn place(app: &str, monitor: &str, position: Position, selector: &Selector) -> Result<(), String> {
     log::info!("placing app={app} monitor={monitor} position={position:?} selector={selector:?}");
     let bounds = monitor_bounds(monitor)?;
-    let frame = position_frame(bounds, position);
+    let frame = position_frame(bounds, position)?;
     let window = find_window(app, selector)?;
     window.set_frame(frame)
 }
