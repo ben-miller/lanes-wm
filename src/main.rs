@@ -16,7 +16,7 @@ use core_foundation_sys::base::{CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::string::CFStringRef;
 use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
-use objc2_app_kit::NSWorkspace;
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 
@@ -149,6 +149,73 @@ fn pids_for_bundle_id(bundle_id: &str) -> Vec<pid_t> {
         .collect()
 }
 
+/// Bring a specific process to the front, by PID rather than bundle ID -
+/// `open -a`/`open -b` can't target one specific instance among several
+/// sharing a bundle ID (e.g. Firefox running multiple profiles), and
+/// `NSRunningApplication` is keyed by PID regardless of that. Placement
+/// alone (setFrame) doesn't affect z-order, so two windows placed at the
+/// same coordinates across different calls - the common case for a
+/// per-lane "this app always goes here" target - need this to make sure
+/// the one you actually want visible ends up on top.
+fn raise_pid(pid: pid_t) -> Result<(), String> {
+    let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .ok_or_else(|| format!("no running application with pid {pid}"))?;
+    // ActivateIgnoringOtherApps is deprecated (macOS 14+) and documented as
+    // having no effect - plain activation (empty options) is what actually
+    // raises the app now.
+    let activated = app.activateWithOptions(NSApplicationActivationOptions::empty());
+    if activated {
+        Ok(())
+    } else {
+        Err(format!("failed to activate pid {pid}"))
+    }
+}
+
+/// Which process(es) a placement targets.
+#[derive(Debug)]
+enum AppTarget {
+    /// Every process matching this bundle ID - the common case.
+    BundleId(String),
+    /// One specific process, by PID. For apps that run as several
+    /// independent instances sharing one bundle ID (e.g. Firefox launched
+    /// with `--profile <path>` for multiple profiles), bundle-ID matching
+    /// alone can't tell them apart - the caller is expected to have
+    /// already resolved which instance it means (e.g. by reading its
+    /// launch arguments) before calling this.
+    Pid(pid_t),
+}
+
+impl AppTarget {
+    fn pids(&self) -> Vec<pid_t> {
+        match self {
+            AppTarget::BundleId(id) => pids_for_bundle_id(id),
+            AppTarget::Pid(pid) => vec![*pid],
+        }
+    }
+
+    /// Human-readable label for error messages and PlacementResult's `app`
+    /// field - a bundle ID, or "pid <N>" when targeted that way.
+    fn label(&self) -> String {
+        match self {
+            AppTarget::BundleId(id) => id.clone(),
+            AppTarget::Pid(pid) => format!("pid {pid}"),
+        }
+    }
+}
+
+/// Build an AppTarget from the (app, pid) pair shared by the CLI flags and
+/// PlacementRequest's JSON fields. Errors if both or neither are set - same
+/// mutual-exclusivity `place`'s clap flags enforce for the CLI case, needed
+/// again here since a JSON batch request bypasses clap's `conflicts_with`.
+fn app_target_from(app: Option<String>, pid: Option<u32>) -> Result<AppTarget, String> {
+    match (app, pid) {
+        (Some(a), None) => Ok(AppTarget::BundleId(a)),
+        (None, Some(p)) => Ok(AppTarget::Pid(p as pid_t)),
+        (Some(_), Some(_)) => Err("app and pid are mutually exclusive".to_string()),
+        (None, None) => Err("one of app or pid is required".to_string()),
+    }
+}
+
 /// How to pick which of an app's windows a placement applies to.
 #[derive(Debug)]
 enum Selector {
@@ -164,58 +231,63 @@ enum Selector {
     Focused,
 }
 
-/// Find the single window matching `app` and `selector`. Deliberately
+/// Find the single window matching `target` and `selector`. Deliberately
 /// strict: zero or multiple matches is an error, not a guess - see
 /// README's "fail loudly" philosophy for monitor matching, which applies
 /// just as much to windows.
-fn find_window(app: &str, selector: &Selector) -> Result<AxElement, String> {
+/// Returns the matched window along with the PID it belongs to - needed
+/// for `--raise`, which activates a specific process rather than going
+/// through a bundle-ID-based (and thus, for a multi-instance app,
+/// ambiguous) app-activation call.
+fn find_window(target: &AppTarget, selector: &Selector) -> Result<(pid_t, AxElement), String> {
     log::debug!("AXIsProcessTrusted: {}", unsafe { AXIsProcessTrusted() });
-    let pids = pids_for_bundle_id(app);
-    log::debug!("pids for {app}: {pids:?}");
+    let pids = target.pids();
+    let label = target.label();
+    log::debug!("pids for {label}: {pids:?}");
     if pids.is_empty() {
-        return Err(format!("app not running: {app}"));
+        return Err(format!("app not running: {label}"));
     }
 
     if let Selector::Focused = selector {
-        let matched: Vec<AxElement> = pids
+        let matched: Vec<(pid_t, AxElement)> = pids
             .into_iter()
-            .filter_map(|pid| AxElement::for_pid(pid).focused_window())
+            .filter_map(|pid| AxElement::for_pid(pid).focused_window().map(|w| (pid, w)))
             .collect();
         return match matched.len() {
-            0 => Err(format!("no focused window (app: {app})")),
+            0 => Err(format!("no focused window (app: {label})")),
             1 => Ok(matched.into_iter().next().unwrap()),
             n => Err(format!(
-                "ambiguous: {n} instances of {app} each have a focused window"
+                "ambiguous: {n} instances of {label} each have a focused window"
             )),
         };
     }
 
-    let windows: Vec<AxElement> = pids
+    let windows: Vec<(pid_t, AxElement)> = pids
         .into_iter()
         .flat_map(|pid| {
             let ws = AxElement::for_pid(pid).windows();
             log::debug!("pid {pid} has {} window(s)", ws.len());
-            ws
+            ws.into_iter().map(move |w| (pid, w))
         })
         .collect();
 
-    let matched: Vec<AxElement> = match selector {
+    let matched: Vec<(pid_t, AxElement)> = match selector {
         Selector::Any => windows,
         Selector::Title(pattern) => {
             let re = regex::Regex::new(pattern).map_err(|e| format!("invalid title pattern {pattern:?}: {e}"))?;
             windows
                 .into_iter()
-                .filter(|w| w.title().is_some_and(|t| re.is_match(&t)))
+                .filter(|(_, w)| w.title().is_some_and(|t| re.is_match(&t)))
                 .collect()
         }
         Selector::Focused => unreachable!("handled above"),
     };
 
     match matched.len() {
-        0 => Err(format!("no window matched (app: {app}, selector: {selector:?})")),
+        0 => Err(format!("no window matched (app: {label}, selector: {selector:?})")),
         1 => Ok(matched.into_iter().next().unwrap()),
         n => Err(format!(
-            "ambiguous: {n} windows matched (app: {app}, selector: {selector:?}) - narrow the title pattern"
+            "ambiguous: {n} windows matched (app: {label}, selector: {selector:?}) - narrow the title pattern"
         )),
     }
 }
@@ -367,9 +439,17 @@ enum Command {
     /// testing - `apply` is the primary interface, since a real lane switch
     /// always moves several windows at once and should do it in one call.
     Place {
-        /// Bundle identifier of the target app, e.g. com.github.wez.wezterm
+        /// Bundle identifier of the target app, e.g. com.github.wez.wezterm.
+        /// Conflicts with --pid.
+        #[arg(long, conflicts_with = "pid")]
+        app: Option<String>,
+        /// Target one specific process by PID instead of a bundle ID - for
+        /// apps that run as several independent instances sharing one
+        /// bundle ID (e.g. Firefox with multiple profiles), where the
+        /// caller has already resolved which instance it means. Conflicts
+        /// with --app; exactly one of the two is required.
         #[arg(long)]
-        app: String,
+        pid: Option<u32>,
         /// Target monitor's CGDisplay UUID (see `lanes-wm monitors`)
         #[arg(long)]
         monitor: String,
@@ -390,6 +470,15 @@ enum Command {
         /// with --title.
         #[arg(long)]
         focused: bool,
+        /// Also bring the matched window's process to the front
+        /// (NSRunningApplication, by PID - not `open`, which can't target
+        /// one specific instance among several sharing a bundle ID).
+        /// Placement alone doesn't affect z-order, so if this app's window
+        /// is placed at the same coordinates on every call (the common
+        /// case for a per-lane "this always goes here" target), whichever
+        /// one was already on top stays there unless raised explicitly.
+        #[arg(long)]
+        raise: bool,
     },
 
     /// Apply a batch of placements read as JSON from stdin, one result per
@@ -405,18 +494,39 @@ enum Command {
 
 #[derive(Deserialize)]
 struct PlacementRequest {
-    app: String,
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
     monitor: String,
     position: Position,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     focused: bool,
+    #[serde(default)]
+    raise: bool,
 }
 
 impl PlacementRequest {
     fn selector(&self) -> Result<Selector, String> {
         selector_from(self.title.clone(), self.focused)
+    }
+
+    fn app_target(&self) -> Result<AppTarget, String> {
+        app_target_from(self.app.clone(), self.pid)
+    }
+
+    /// Label for PlacementResult's `app` field - the bundle ID if that's
+    /// how this request targeted its app, else "pid <N>". Computed even
+    /// when app_target() itself would error (both or neither given), so
+    /// the per-item result still has something meaningful to show.
+    fn label(&self) -> String {
+        match (&self.app, self.pid) {
+            (Some(a), _) => a.clone(),
+            (None, Some(p)) => format!("pid {p}"),
+            (None, None) => "?".to_string(),
+        }
     }
 }
 
@@ -461,12 +571,16 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Monitors => list_monitors(cli.compact),
-        Command::Place { app, monitor, position, title, focused } => {
+        Command::Place { app, pid, monitor, position, title, focused, raise } => {
+            let target = app_target_from(app, pid).unwrap_or_else(|e| {
+                eprintln!("lanes-wm: {e}");
+                std::process::exit(1);
+            });
             let selector = selector_from(title, focused).unwrap_or_else(|e| {
                 eprintln!("lanes-wm: {e}");
                 std::process::exit(1);
             });
-            if let Err(e) = place(&app, &monitor, Position::Preset(position), &selector) {
+            if let Err(e) = place(&target, &monitor, Position::Preset(position), &selector, raise) {
                 eprintln!("lanes-wm: {e}");
                 std::process::exit(1);
             }
@@ -535,12 +649,19 @@ fn list_monitors(compact: bool) {
     print_json(&monitors, compact);
 }
 
-fn place(app: &str, monitor: &str, position: Position, selector: &Selector) -> Result<(), String> {
-    log::info!("placing app={app} monitor={monitor} position={position:?} selector={selector:?}");
+fn place(target: &AppTarget, monitor: &str, position: Position, selector: &Selector, raise: bool) -> Result<(), String> {
+    log::info!(
+        "placing app={} monitor={monitor} position={position:?} selector={selector:?} raise={raise}",
+        target.label()
+    );
     let bounds = monitor_bounds(monitor)?;
     let frame = position_frame(bounds, position)?;
-    let window = find_window(app, selector)?;
-    window.set_frame(frame)
+    let (pid, window) = find_window(target, selector)?;
+    window.set_frame(frame)?;
+    if raise {
+        raise_pid(pid)?;
+    }
+    Ok(())
 }
 
 fn apply(compact: bool) {
@@ -555,14 +676,16 @@ fn apply(compact: bool) {
     let results: Vec<PlacementResult> = requests
         .into_iter()
         .map(|req| {
-            let outcome = req
-                .selector()
-                .and_then(|selector| place(&req.app, &req.monitor, req.position, &selector));
+            let label = req.label();
+            let outcome = req.app_target().and_then(|target| {
+                let selector = req.selector()?;
+                place(&target, &req.monitor, req.position, &selector, req.raise)
+            });
             match outcome {
-                Ok(()) => PlacementResult { app: req.app, ok: true, error: None },
+                Ok(()) => PlacementResult { app: label, ok: true, error: None },
                 Err(e) => {
                     log::warn!("placement failed: {e}");
-                    PlacementResult { app: req.app, ok: false, error: Some(e) }
+                    PlacementResult { app: label, ok: false, error: Some(e) }
                 }
             }
         })

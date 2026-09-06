@@ -101,10 +101,20 @@ All commands pretty-print JSON by default; pass `--compact` for single-line
 output when piping to another program, e.g. `lanes-wm monitors --compact`.
 
 ```
-lanes-wm place --app <bundle-id> --monitor <uuid> --position <preset> [--title <regex> | --focused]
+lanes-wm place (--app <bundle-id> | --pid <pid>) --monitor <uuid> --position <preset> [--title <regex> | --focused]
 ```
 Single placement. Exit 0 on success; non-zero + stderr message on failure
 (app not running, monitor not found, etc).
+
+`--app` and `--pid` are mutually exclusive, exactly one is required:
+
+- `--app` - every process matching this bundle ID. The common case.
+- `--pid` - one specific process, by PID. For apps that run as several
+  independent instances sharing one bundle ID - e.g. Firefox launched
+  multiple times with `--profile <path>` for different profiles - bundle ID
+  matching alone can't tell the instances apart. The caller is expected to
+  have already resolved which instance it means (e.g. by matching a running
+  process's launch arguments) before calling this.
 
 Two mutually exclusive, optional ways to pick which window when the app has
 more than one - omit both only when the app is known to have exactly one
@@ -128,17 +138,30 @@ window:
 Matching is strict either way: 0 matches or 2+ matches is an error, not a
 guess - see "Design decisions" above for why.
 
+`--raise` additionally brings the matched window's process to the front
+(`NSRunningApplication`, by the PID the window was actually resolved from -
+not `open`, which is bundle-ID-based and can't target one specific instance
+among several sharing a bundle ID). Placement alone doesn't affect z-order:
+if an app's window gets placed at the same coordinates on every call (the
+common case for a per-lane "this always goes here" target, e.g. switching
+which Firefox profile occupies a fixed screen region), whichever one was
+already on top stays there, hiding the newly-placed one underneath, unless
+raised explicitly.
+
 ```
 lanes-wm apply
 ```
 The primary interface: reads a JSON array of placement requests from stdin
 and applies them as a single batch (one call, not a loop of single
 placements) - this is how a lane's whole window layout gets applied in one
-shot. Each `app` is resolved once, then every matched window for that app is
+shot. Each `app` (or `pid`) is resolved once, then every matched window is
 placed:
 ```json
 [{"app": "com.github.wez.wezterm", "monitor": "37D8832A-...", "position": "full", "title": "main"}]
 ```
+`pid` is the JSON equivalent of `--pid`, same mutual exclusivity with `app`
+as the CLI flags - a request setting both, or neither, is a per-item failure
+rather than a crash (JSON input bypasses clap's `conflicts_with`).
 `position` accepts either a preset string (as above) or a raw grid span -
 `{"cols": 3, "col": [1, 2]}` is the left two-thirds, `{"cols": 2, "col": [1,
 1], "rows": 2, "row": [1, 1]}` is the top-left quadrant. `cols`/`rows`
@@ -151,8 +174,8 @@ placement failure, not a silent clamp.
 `title` and `focused` are optional, same semantics as `place`'s flags, and
 still mutually exclusive - a request setting both is a per-item failure, not
 a crash (JSON input bypasses the CLI's flag-conflict check, so it's
-re-validated here). Writes one result per input to stdout, so a partial
-failure doesn't abort the batch:
+re-validated here). `raise` is the JSON equivalent of `--raise`. Writes one
+result per input to stdout, so a partial failure doesn't abort the batch:
 ```json
 [{"app": "com.github.wez.wezterm", "ok": true}]
 ```
