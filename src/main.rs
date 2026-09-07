@@ -490,6 +490,13 @@ enum Command {
     /// System Settings > Privacy & Security > Accessibility does not
     /// reliably register - this does it the way macOS expects.
     RequestAccess,
+
+    /// Report Accessibility trust status with no side effects, exit code
+    /// only (0 trusted, 1 not) - unlike `request-access`, never triggers
+    /// the system permission prompt. Meant for a diagnostic (e.g. lanes'
+    /// `doctor`) to check status on every run without ever popping a
+    /// dialog just from running a health check.
+    Trusted,
 }
 
 #[derive(Deserialize)]
@@ -587,6 +594,11 @@ fn main() {
         }
         Command::Apply => apply(cli.compact),
         Command::RequestAccess => request_access(),
+        Command::Trusted => {
+            if !unsafe { AXIsProcessTrusted() } {
+                std::process::exit(1);
+            }
+        }
     }
 }
 

@@ -189,6 +189,15 @@ or reports that access is already granted. Use this instead of manually
 adding the binary through the Accessibility settings `+` button, which
 doesn't reliably register raw (non-`.app`-bundle) executables.
 
+```
+lanes-wm trusted
+```
+Reports Accessibility trust status via exit code only (0 trusted, 1 not) -
+no output, no side effects, and unlike `request-access`, never triggers the
+system permission prompt. Meant for a diagnostic (e.g. lanes' `doctor`) to
+check status on every run without popping a dialog just from running a
+health check.
+
 ## Local dev setup: Accessibility permissions
 
 Placing windows requires the Accessibility (TCC) permission grant (System
