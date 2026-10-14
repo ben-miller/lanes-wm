@@ -180,6 +180,16 @@ result per input to stdout, so a partial failure doesn't abort the batch:
 [{"app": "com.github.wez.wezterm", "ok": true}]
 ```
 
+`minimized` (true/false) minimizes or de-minimizes the matched window via
+`kAXMinimizedAttribute`, instead of moving/resizing it - `monitor`/
+`position` become optional for this reason, and a request setting both
+`minimized` and `monitor`/`position` is a per-item failure (raising a
+window you just asked to minimize is contradictory, so this is never
+combined with placement or `raise`):
+```json
+[{"app": "com.electron.wispr-flow.accessibility-mac-app", "minimized": true}]
+```
+
 ```
 lanes-wm request-access
 ```

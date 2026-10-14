@@ -1,9 +1,9 @@
 use accessibility_sys::{
-    kAXErrorFailure, kAXErrorSuccess, kAXFocusedWindowAttribute, kAXPositionAttribute,
-    kAXSizeAttribute, kAXTitleAttribute, kAXTrustedCheckOptionPrompt, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowsAttribute, pid_t, AXError, AXIsProcessTrusted,
-    AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementRef, AXUIElementSetAttributeValue, AXValueCreate,
+    kAXErrorFailure, kAXErrorSuccess, kAXFocusedWindowAttribute, kAXMinimizedAttribute,
+    kAXPositionAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXTrustedCheckOptionPrompt,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute, pid_t, AXError,
+    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetAttributeValue, AXValueCreate,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use core_foundation::base::TCFType;
@@ -109,6 +109,23 @@ impl AxElement {
         self.set_ax_value(kAXSizeAttribute, kAXValueTypeCGSize, &frame.size)
             .map_err(|e| format!("failed to set size: {}", accessibility_sys::error_string(e)))?;
         Ok(())
+    }
+
+    /// Set kAXMinimizedAttribute. Unlike position/size, this is a plain
+    /// boolean attribute - no AXValueCreate wrapping (that's only for the
+    /// geometry/range AXValue types position/size use), just a CFBoolean
+    /// passed directly to AXUIElementSetAttributeValue.
+    fn set_minimized(&self, minimized: bool) -> Result<(), String> {
+        let attr = CFString::new(kAXMinimizedAttribute);
+        let value = if minimized { CFBoolean::true_value() } else { CFBoolean::false_value() };
+        let err = unsafe {
+            AXUIElementSetAttributeValue(self.0, attr.as_concrete_TypeRef(), value.as_concrete_TypeRef() as CFTypeRef)
+        };
+        if err == kAXErrorSuccess {
+            Ok(())
+        } else {
+            Err(format!("failed to set minimized: {}", accessibility_sys::error_string(err)))
+        }
     }
 
     fn set_ax_value<T>(&self, attribute: &str, ax_type: u32, value: &T) -> Result<(), AXError> {
@@ -505,14 +522,26 @@ struct PlacementRequest {
     app: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
-    monitor: String,
-    position: Position,
+    /// `monitor`/`position` are optional as a pair - a request with
+    /// `minimized: true` and neither doesn't place the window at all, it
+    /// only minimizes it. A request setting one without the other is a
+    /// per-item failure, same class of thing as `app`/`pid` both-or-neither.
+    #[serde(default)]
+    monitor: Option<String>,
+    #[serde(default)]
+    position: Option<Position>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     focused: bool,
     #[serde(default)]
     raise: bool,
+    /// Minimize (true) or de-minimize (false) the matched window via
+    /// kAXMinimizedAttribute, instead of (not in addition to - raising a
+    /// window you just asked to minimize makes no sense) moving/resizing
+    /// it. Mutually exclusive with `monitor`/`position` being set.
+    #[serde(default)]
+    minimized: Option<bool>,
 }
 
 impl PlacementRequest {
@@ -689,10 +718,7 @@ fn apply(compact: bool) {
         .into_iter()
         .map(|req| {
             let label = req.label();
-            let outcome = req.app_target().and_then(|target| {
-                let selector = req.selector()?;
-                place(&target, &req.monitor, req.position, &selector, req.raise)
-            });
+            let outcome = apply_one(&req);
             match outcome {
                 Ok(()) => PlacementResult { app: label, ok: true, error: None },
                 Err(e) => {
@@ -703,4 +729,38 @@ fn apply(compact: bool) {
         })
         .collect();
     print_json(&results, compact);
+}
+
+/// One request's worth of work: either minimize/de-minimize the matched
+/// window, or place it (optionally raising) - never both, since raising a
+/// window you just asked to minimize is contradictory.
+fn apply_one(req: &PlacementRequest) -> Result<(), String> {
+    let target = req.app_target()?;
+    let selector = req.selector()?;
+
+    if let Some(minimized) = req.minimized {
+        if req.monitor.is_some() || req.position.is_some() {
+            return Err("`minimized` is mutually exclusive with `monitor`/`position`".to_string());
+        }
+        let (_, window) = find_window(&target, &selector)?;
+        log::info!("setting minimized={minimized} app={}", target.label());
+        return window.set_minimized(minimized);
+    }
+
+    match (&req.monitor, req.position) {
+        // Neither monitor nor position - a pure activation request, for a
+        // target whose whole job is "bring the right window/profile
+        // forward" with no move/resize involved (that's `raise`'s only
+        // meaning here; a request with raise=false too is a no-op resolve,
+        // which is on the caller, not this function's problem to reject).
+        (None, None) => {
+            let (pid, _window) = find_window(&target, &selector)?;
+            if req.raise {
+                raise_pid(pid)?;
+            }
+            Ok(())
+        }
+        (Some(monitor), Some(position)) => place(&target, monitor, position, &selector, req.raise),
+        _ => Err("request must set both `monitor` and `position` together, or neither".to_string()),
+    }
 }
