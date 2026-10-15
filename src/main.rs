@@ -13,6 +13,7 @@ use core_foundation::string::CFString;
 use core_foundation::uuid::{CFUUID, CFUUIDRef};
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation_sys::base::{CFRelease, CFRetain, CFTypeRef};
+use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanRef};
 use core_foundation_sys::string::CFStringRef;
 use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
@@ -103,12 +104,53 @@ impl AxElement {
         Some(cf_string.to_string())
     }
 
-    fn set_frame(&self, frame: CGRect) -> Result<(), String> {
-        self.set_ax_value(kAXPositionAttribute, kAXValueTypeCGPoint, &frame.origin)
-            .map_err(|e| format!("failed to set position: {}", accessibility_sys::error_string(e)))?;
-        self.set_ax_value(kAXSizeAttribute, kAXValueTypeCGSize, &frame.size)
-            .map_err(|e| format!("failed to set size: {}", accessibility_sys::error_string(e)))?;
-        Ok(())
+    /// Size -> position -> size, with `AXEnhancedUserInterface` (on the
+    /// owning *app*, not this window) toggled off for the duration if it
+    /// was on - exactly what Hammerspoon's `HSuicore.m setFrame:` does, and
+    /// for the same reason: some apps (Firefox among them, confirmed by
+    /// actually hitting this - a lane switch moving Firefox between two
+    /// very different positions visibly glided there instead of jumping,
+    /// surviving both `NSWindowResizeTime` and Reduce Motion, neither of
+    /// which touch this) animate or otherwise mishandle a plain
+    /// position-then-size pair applied via Accessibility API. A single
+    /// `set_ax_value` call still only ever changes one attribute - this
+    /// doesn't make the underlying calls atomic, it just matches the
+    /// sequence/flag-toggling that avoids the animation in practice.
+    fn set_frame(&self, pid: pid_t, frame: CGRect) -> Result<(), String> {
+        let app = AxElement::for_pid(pid);
+        let had_enhanced_ui = app.enhanced_user_interface();
+        if had_enhanced_ui {
+            let _ = app.set_boolean_attribute("AXEnhancedUserInterface", false);
+        }
+
+        let result = (|| {
+            self.set_ax_value(kAXSizeAttribute, kAXValueTypeCGSize, &frame.size)
+                .map_err(|e| format!("failed to set size: {}", accessibility_sys::error_string(e)))?;
+            self.set_ax_value(kAXPositionAttribute, kAXValueTypeCGPoint, &frame.origin)
+                .map_err(|e| format!("failed to set position: {}", accessibility_sys::error_string(e)))?;
+            self.set_ax_value(kAXSizeAttribute, kAXValueTypeCGSize, &frame.size)
+                .map_err(|e| format!("failed to set size: {}", accessibility_sys::error_string(e)))
+        })();
+
+        if had_enhanced_ui {
+            let _ = app.set_boolean_attribute("AXEnhancedUserInterface", true);
+        }
+        result
+    }
+
+    /// Whether the owning app currently has `AXEnhancedUserInterface` set -
+    /// an undocumented attribute some apps expose; absent (most apps) or
+    /// unreadable reads as `false`, same as Hammerspoon's handling of it.
+    fn enhanced_user_interface(&self) -> bool {
+        let Ok(value) = self.copy_attribute("AXEnhancedUserInterface") else {
+            return false;
+        };
+        if value.is_null() {
+            return false;
+        }
+        let result = unsafe { CFBooleanGetValue(value as CFBooleanRef) };
+        unsafe { CFRelease(value) };
+        result
     }
 
     /// Set kAXMinimizedAttribute. Unlike position/size, this is a plain
@@ -116,15 +158,28 @@ impl AxElement {
     /// geometry/range AXValue types position/size use), just a CFBoolean
     /// passed directly to AXUIElementSetAttributeValue.
     fn set_minimized(&self, minimized: bool) -> Result<(), String> {
-        let attr = CFString::new(kAXMinimizedAttribute);
-        let value = if minimized { CFBoolean::true_value() } else { CFBoolean::false_value() };
+        self.set_boolean_attribute(kAXMinimizedAttribute, minimized)
+            .map_err(|e| format!("failed to set minimized: {}", accessibility_sys::error_string(e)))
+    }
+
+    /// Shared by `set_minimized` and `set_frame`'s `AXEnhancedUserInterface`
+    /// toggle - any plain boolean attribute, no AXValueCreate wrapping
+    /// (that's only for the geometry/range AXValue types position/size
+    /// use), just a CFBoolean passed directly to
+    /// AXUIElementSetAttributeValue. Errors are swallowed at the
+    /// `AXEnhancedUserInterface` call site (best-effort - a failure there
+    /// shouldn't block the frame change it's wrapping), but still returned
+    /// here since `set_minimized` does want to surface one.
+    fn set_boolean_attribute(&self, attribute: &str, value: bool) -> Result<(), AXError> {
+        let attr = CFString::new(attribute);
+        let cf_value = if value { CFBoolean::true_value() } else { CFBoolean::false_value() };
         let err = unsafe {
-            AXUIElementSetAttributeValue(self.0, attr.as_concrete_TypeRef(), value.as_concrete_TypeRef() as CFTypeRef)
+            AXUIElementSetAttributeValue(self.0, attr.as_concrete_TypeRef(), cf_value.as_concrete_TypeRef() as CFTypeRef)
         };
         if err == kAXErrorSuccess {
             Ok(())
         } else {
-            Err(format!("failed to set minimized: {}", accessibility_sys::error_string(err)))
+            Err(err)
         }
     }
 
@@ -697,8 +752,16 @@ fn place(target: &AppTarget, monitor: &str, position: Position, selector: &Selec
     );
     let bounds = monitor_bounds(monitor)?;
     let frame = position_frame(bounds, position)?;
-    let (pid, window) = find_window(target, selector)?;
-    window.set_frame(frame)?;
+    // Same "nothing to act on isn't a failure" leniency as the minimize/
+    // raise-only path - a `--focused` selector right after activation
+    // (see apply_targets' own comment on why placement always uses it)
+    // racing a just-launched app's window not existing yet is routine, not
+    // exceptional, and was already a silent no-op visually before this -
+    // the only change is not alerting on it too.
+    let Some((pid, window)) = find_window_or_nothing_to_do(target, selector)? else {
+        return Ok(());
+    };
+    window.set_frame(pid, frame)?;
     if raise {
         raise_pid(pid)?;
     }
@@ -734,6 +797,38 @@ fn apply(compact: bool) {
 /// One request's worth of work: either minimize/de-minimize the matched
 /// window, or place it (optionally raising) - never both, since raising a
 /// window you just asked to minimize is contradictory.
+/// `find_window`, but a target with nothing to act on at all (not running,
+/// or running with zero matching windows) resolves to `Ok(None)` instead
+/// of an error - for the two request kinds (minimize/de-minimize, pure
+/// raise) whose whole point is "do this to whatever's there, if anything."
+/// An app that's only sometimes open (Wispr Flow, say, open only while
+/// actively dictating) would otherwise fail its minimize request on every
+/// single switch where it happens to be closed - not a real problem, just
+/// nothing to do. `ambiguous: N windows matched` is a genuinely different
+/// case - multiple candidates, not zero - and still propagates as an
+/// error, since guessing which one is wrong, not nothing.
+/// Distinguishes `find_window`'s "zero candidates" errors (nothing to do)
+/// from "ambiguous" (multiple candidates - a real problem, needs a
+/// narrower selector, not something to paper over). Pulled out as its own
+/// pure function, matching this message-prefix contract against
+/// `find_window`'s own error strings, so this one piece of genuinely
+/// testable logic doesn't require an AX/GUI session the rest of this file
+/// needs.
+fn is_nothing_to_do_error(message: &str) -> bool {
+    message.starts_with("app not running") || message.starts_with("no window matched") || message.starts_with("no focused window")
+}
+
+fn find_window_or_nothing_to_do(target: &AppTarget, selector: &Selector) -> Result<Option<(pid_t, AxElement)>, String> {
+    match find_window(target, selector) {
+        Ok(found) => Ok(Some(found)),
+        Err(e) if is_nothing_to_do_error(&e) => {
+            log::info!("nothing to do for {}: {e}", target.label());
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn apply_one(req: &PlacementRequest) -> Result<(), String> {
     let target = req.app_target()?;
     let selector = req.selector()?;
@@ -742,7 +837,9 @@ fn apply_one(req: &PlacementRequest) -> Result<(), String> {
         if req.monitor.is_some() || req.position.is_some() {
             return Err("`minimized` is mutually exclusive with `monitor`/`position`".to_string());
         }
-        let (_, window) = find_window(&target, &selector)?;
+        let Some((_, window)) = find_window_or_nothing_to_do(&target, &selector)? else {
+            return Ok(());
+        };
         log::info!("setting minimized={minimized} app={}", target.label());
         return window.set_minimized(minimized);
     }
@@ -754,7 +851,9 @@ fn apply_one(req: &PlacementRequest) -> Result<(), String> {
         // meaning here; a request with raise=false too is a no-op resolve,
         // which is on the caller, not this function's problem to reject).
         (None, None) => {
-            let (pid, _window) = find_window(&target, &selector)?;
+            let Some((pid, _window)) = find_window_or_nothing_to_do(&target, &selector)? else {
+                return Ok(());
+            };
             if req.raise {
                 raise_pid(pid)?;
             }
@@ -762,5 +861,35 @@ fn apply_one(req: &PlacementRequest) -> Result<(), String> {
         }
         (Some(monitor), Some(position)) => place(&target, monitor, position, &selector, req.raise),
         _ => Err("request must set both `monitor` and `position` together, or neither".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_to_do_for_app_not_running() {
+        assert!(is_nothing_to_do_error("app not running: com.example.app"));
+    }
+
+    #[test]
+    fn nothing_to_do_for_no_window_matched() {
+        assert!(is_nothing_to_do_error("no window matched (app: com.example.app, selector: Any)"));
+    }
+
+    #[test]
+    fn nothing_to_do_for_no_focused_window() {
+        assert!(is_nothing_to_do_error("no focused window (app: com.example.app)"));
+    }
+
+    #[test]
+    fn ambiguous_is_a_real_error_not_nothing_to_do() {
+        assert!(!is_nothing_to_do_error("ambiguous: 2 windows matched (app: org.mozilla.firefox, selector: Any) - narrow the title pattern"));
+    }
+
+    #[test]
+    fn an_unrelated_message_is_not_nothing_to_do() {
+        assert!(!is_nothing_to_do_error("invalid title pattern \"[\": regex parse error"));
     }
 }
